@@ -1,0 +1,6 @@
+.env
+.venv
+__pycache__
+/photogallery/static
+../.DS_Store
+.DS_Store
