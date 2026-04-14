@@ -1,0 +1,10 @@
+flask
+gunicorn
+pymysql
+exifread
+python-dotenv
+pillow
+google-cloud-storage
+google-cloud-secret-manager
+google-auth
+google-api-core

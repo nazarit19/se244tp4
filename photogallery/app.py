@@ -29,6 +29,7 @@ import os
 import io
 import time
 import datetime
+from functools import lru_cache
 from datetime import timedelta
 import exifread
 import json
@@ -43,7 +44,43 @@ load_dotenv()
 
 app = Flask(__name__, template_folder="./", static_url_path="/assets", static_folder="assets")
 
-secret_key = os.getenv("SECRET_KEY")
+
+def _is_truthy(value):
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+@lru_cache(maxsize=1)
+def get_secret_manager_client():
+    from google.cloud import secretmanager
+    return secretmanager.SecretManagerServiceClient()
+
+
+def get_config_value(name, default=None):
+    value = os.getenv(name)
+    if value not in (None, ""):
+        return value
+
+    if not _is_truthy(os.getenv("USE_SECRET_MANAGER", "true")):
+        return default
+
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT")
+    if not project_id:
+        return default
+
+    secret_version = os.getenv("SECRET_VERSION", "latest")
+    secret_path = f"projects/{project_id}/secrets/{name}/versions/{secret_version}"
+
+    try:
+        response = get_secret_manager_client().access_secret_version(name=secret_path)
+        secret_value = response.payload.data.decode("utf-8").strip()
+        if secret_value:
+            return secret_value
+    except Exception as error:
+        app.logger.warning("Secret lookup failed for %s: %s", name, error)
+
+    return default
+
+secret_key = get_config_value("SECRET_KEY")
 if not secret_key:
     # Keep development sessions stable across app reloads when SECRET_KEY is missing.
     secret_key = "dev-secret-key-change-me"
@@ -52,21 +89,28 @@ app.secret_key = secret_key
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
-    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true",
-    PERMANENT_SESSION_LIFETIME=timedelta(hours=int(os.getenv("SESSION_LIFETIME_HOURS", "24")))
+    SESSION_COOKIE_SECURE=_is_truthy(get_config_value("SESSION_COOKIE_SECURE", "false")),
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=int(get_config_value("SESSION_LIFETIME_HOURS", "24")))
 )
 
 ALLOWED_EXTENSIONS = set(['png', 'jpg', 'jpeg'])
-BUCKET_NAME=os.getenv("BUCKET_NAME")
+BUCKET_NAME=get_config_value("BUCKET_NAME")
 GCS_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCS_PROJECT")
 GCS_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("GCS_CREDENTIALS_PATH")
-DB_HOSTNAME="34.173.242.26"
-DB_USERNAME=os.getenv("USERNAME")
-DB_PASSWORD=os.getenv("PASSWORD")
-DB_NAME=os.getenv("DB_NAME")
-PHOTOS_PER_PAGE = int(os.getenv("PHOTOS_PER_PAGE", "12"))
-SIGNED_URL_TTL_MINUTES = int(os.getenv("SIGNED_URL_TTL_MINUTES", "60"))
-THUMBNAIL_JPEG_QUALITY = int(os.getenv("THUMBNAIL_JPEG_QUALITY", "75"))
+DB_HOSTNAME=get_config_value("DB_HOSTNAME", "34.173.242.26")
+DB_PORT = int(get_config_value("DB_PORT", "3306"))
+DB_USERNAME=get_config_value("USERNAME")
+DB_PASSWORD=get_config_value("PASSWORD")
+DB_NAME=get_config_value("DB_NAME")
+DB_CONNECT_TIMEOUT = int(get_config_value("DB_CONNECT_TIMEOUT", "10"))
+CLOUD_SQL_CONNECTION_NAME = get_config_value("CLOUD_SQL_CONNECTION_NAME")
+DB_UNIX_SOCKET = get_config_value(
+    "DB_UNIX_SOCKET",
+    ("/cloudsql/" + CLOUD_SQL_CONNECTION_NAME) if CLOUD_SQL_CONNECTION_NAME else None
+)
+PHOTOS_PER_PAGE = int(get_config_value("PHOTOS_PER_PAGE", "12"))
+SIGNED_URL_TTL_MINUTES = int(get_config_value("SIGNED_URL_TTL_MINUTES", "60"))
+THUMBNAIL_JPEG_QUALITY = int(get_config_value("THUMBNAIL_JPEG_QUALITY", "75"))
 
 # Metadata access on VMs can break when proxy settings or custom CA settings intercept requests.
 # Prefer the link-local metadata endpoint and force metadata hosts into no_proxy.
@@ -139,17 +183,31 @@ def get_gcs_client():
     return GCS_CLIENT
 
 
+def create_db_connection():
+    conn_kwargs = {
+        "user": DB_USERNAME,
+        "passwd": DB_PASSWORD,
+        "db": DB_NAME,
+        "connect_timeout": DB_CONNECT_TIMEOUT,
+    }
+
+    # On App Engine + Cloud SQL, prefer the unix socket mounted at /cloudsql/INSTANCE.
+    if DB_UNIX_SOCKET:
+        conn_kwargs["unix_socket"] = DB_UNIX_SOCKET
+    else:
+        conn_kwargs["host"] = DB_HOSTNAME
+        conn_kwargs["port"] = DB_PORT
+
+    return pymysql.connect(**conn_kwargs)
+
+
 def is_photo_userid_numeric():
     global PHOTO_USERID_IS_NUMERIC
     if PHOTO_USERID_IS_NUMERIC is not None:
         return PHOTO_USERID_IS_NUMERIC
 
     try:
-        conn = pymysql.connect(host=DB_HOSTNAME,
-                               user=DB_USERNAME,
-                               passwd=DB_PASSWORD,
-                               db=DB_NAME,
-                               port=3306)
+        conn = create_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT DATA_TYPE FROM information_schema.COLUMNS "
@@ -181,11 +239,7 @@ def get_photo_userid_value():
     if not username:
         return None
 
-    conn = pymysql.connect(host=DB_HOSTNAME,
-                           user=DB_USERNAME,
-                           passwd=DB_PASSWORD,
-                           db=DB_NAME,
-                           port=3306)
+    conn = create_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT UserID FROM photogallery.Users WHERE Email=%s;", (username,))
     row = cursor.fetchone()
@@ -393,11 +447,7 @@ def home_page():
     page = get_page_value(request.args)
     offset = (page - 1) * PHOTOS_PER_PAGE
 
-    conn = pymysql.connect (host = DB_HOSTNAME,
-                        user = DB_USERNAME,
-                        passwd = DB_PASSWORD,
-                        db = DB_NAME, 
-            port = 3306)
+    conn = create_db_connection()
     cursor = conn.cursor ()
     cursor.execute("SELECT COUNT(*) FROM photogallery.photogallery;")
     total_count = cursor.fetchone()[0]
@@ -435,11 +485,7 @@ def my_photos():
     page = get_page_value(request.args)
     offset = (page - 1) * PHOTOS_PER_PAGE
 
-    conn = pymysql.connect(host=DB_HOSTNAME,
-                        user=DB_USERNAME,
-                        passwd=DB_PASSWORD,
-                        db=DB_NAME,
-                        port=3306)
+    conn = create_db_connection()
     cursor = conn.cursor()
     owner_id = get_photo_userid_value()
     if owner_id is None:
@@ -479,11 +525,7 @@ def register():
     if request.method == 'POST':
         email = request.form['email']
         password = request.form['password']
-        conn = pymysql.connect(host=DB_HOSTNAME,
-                            user=DB_USERNAME,
-                            passwd=DB_PASSWORD,
-                            db=DB_NAME,
-                            port=3306)
+        conn = create_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM photogallery.Users WHERE Email=%s;", (email,))
         existing = cursor.fetchone()
@@ -507,11 +549,7 @@ def login():
     if request.method == 'POST':
         email = request.form['email']
         password = request.form['password']
-        conn = pymysql.connect(host=DB_HOSTNAME,
-                            user=DB_USERNAME,
-                            passwd=DB_PASSWORD,
-                            db=DB_NAME,
-                            port=3306)
+        conn = create_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM photogallery.Users WHERE Email=%s;", (email,))
         user = cursor.fetchone()
@@ -563,11 +601,7 @@ def add_photo():
             timestamp = datetime.datetime.\
                         fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
 
-            conn = pymysql.connect (host = DB_HOSTNAME,
-                        user = DB_USERNAME,
-                        passwd = DB_PASSWORD,
-                        db = DB_NAME,
-            port = 3306)
+            conn = create_db_connection()
             cursor = conn.cursor ()
 
             statement = "INSERT INTO photogallery.photogallery \
@@ -596,11 +630,7 @@ def add_photo():
 
 @app.route('/<int:photoID>', methods=['GET'])
 def view_photo(photoID):    
-    conn = pymysql.connect (host = DB_HOSTNAME,
-                        user = DB_USERNAME,
-                        passwd = DB_PASSWORD,
-                        db = DB_NAME, 
-            port = 3306)
+    conn = create_db_connection()
     cursor = conn.cursor ()
 
     cursor.execute("SELECT * FROM photogallery.photogallery \
@@ -632,11 +662,7 @@ def search_page():
     page = get_page_value(request.args)
     offset = (page - 1) * PHOTOS_PER_PAGE
 
-    conn = pymysql.connect (host = DB_HOSTNAME,
-                        user = DB_USERNAME,
-                        passwd = DB_PASSWORD,
-                        db = DB_NAME, 
-            port = 3306)
+    conn = create_db_connection()
     cursor = conn.cursor ()
 
     like_query = '%' + query + '%'
@@ -683,11 +709,7 @@ def my_search_page():
     page = get_page_value(request.args)
     offset = (page - 1) * PHOTOS_PER_PAGE
 
-    conn = pymysql.connect(host=DB_HOSTNAME,
-                        user=DB_USERNAME,
-                        passwd=DB_PASSWORD,
-                        db=DB_NAME,
-                        port=3306)
+    conn = create_db_connection()
     cursor = conn.cursor()
     owner_id = get_photo_userid_value()
     if owner_id is None:

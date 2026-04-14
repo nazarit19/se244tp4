@@ -1,0 +1,15 @@
+runtime: python311
+env: standard
+
+entrypoint: gunicorn -b :$PORT photogallery.app:app
+
+instance_class: F1
+
+beta_settings:
+  cloud_sql_instances: project-fbc74fdb-f2d5-4f06-935:us-central1:project3
+
+env_variables:
+  SESSION_COOKIE_SECURE: "true"
+  USE_SECRET_MANAGER: "true"
+  CLOUD_SQL_CONNECTION_NAME: "project-fbc74fdb-f2d5-4f06-935:us-central1:project3"
+
