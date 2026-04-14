@@ -29,6 +29,7 @@ for first time usage:
 		- boto3
 		- dotenv
 		- google-cloud-storage
+  		- pillow
 * run the flask application in the terminal within the photogallery folder 
 	- flask run 
 * to run createtable.py
