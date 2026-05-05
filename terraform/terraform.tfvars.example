@@ -1,0 +1,17 @@
+# Copy this file to terraform.tfvars and fill in your values
+# DO NOT commit terraform.tfvars to git (it contains secrets)
+
+project_id             = "project-fbc74fdb-f2d5-4f06-935"
+region                 = "us-central1"
+zone                   = "us-central1-a"
+terraform_state_bucket = "YOUR_GCS_BUCKET_NAME"
+
+# Database
+db_instance_name = "project3"
+db_name          = "photogallery"
+db_user          = "root"
+db_password      = "password"
+
+# App
+app_port    = 3000
+environment = "dev"
