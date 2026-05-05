@@ -397,6 +397,9 @@ def gcs_uploading(filename, file_stream, content_type=None):
 
     return "gcs://" + BUCKET_NAME + "/" + blob_path
 
+@app.route('/health')
+def health_check():
+    return {'status': 'healthy'}, 200
 
 @app.route('/media/<path:blob_path>', methods=['GET'])
 def serve_blob(blob_path):
